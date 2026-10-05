@@ -1,0 +1,10 @@
+config,batch,tok_per_s,prefill_s
+ours_cache,1,35.6,0.029
+ours_cache,8,280.9,0.0292
+ours_cache,32,1108.9,0.0305
+ours_graph,1,123.8,
+ours_graph,8,835.2,
+ours_graph,32,2026.1,
+vllm,1,172.6,
+vllm,8,1258.9,
+vllm,32,3639.0,

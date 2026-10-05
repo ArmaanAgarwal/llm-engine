@@ -1,0 +1,3 @@
+precision,perplexity,weight_mb
+fp16,18.071,988
+int8,17.991,631

@@ -28,12 +28,21 @@ Decode throughput, tokens/sec (aggregate across the batch):
 
 | Configuration | batch 1 | batch 8 | batch 32 |
 |---|---|---|---|
-| Hugging Face `generate`, fp16 | 29.5 | 223 | 900 |
-| Ours, no cache, fp32 (32 tokens) | 42.9 | 115 | 133 |
-| Ours, KV cache, fp16 | 36.5 | 276 | **1107** |
-| Ours + INT8 weight-only | 28.4 | 220 | 913 |
-| Ours + fused RMSNorm kernel | 34.8 | 271 | 1063 |
-| vLLM, fp16 | — | — | 3690 |
+| Hugging Face `generate`, fp16 | 28.6 | 240 | 919 |
+| Ours, no cache, fp32 (32 tokens) | 34.2 | 114 | 131 |
+| Ours, KV cache, fp16 | 36.0 | 282 | 1076 |
+| **Ours + CUDA-graph decode** | **120** | **806** | **1929** |
+| Ours + INT8 weight-only | 29.5 | 228 | 879 |
+| Ours + fused RMSNorm kernel | 31.2 | 265 | 990 |
+| vLLM, fp16 | — | — | 3449 |
+
+Fused RMSNorm kernel vs PyTorch's three-op version (`bench/kernel_bench.py`):
+
+| Shape | PyTorch | Fused | Speedup | Fused bandwidth |
+|---|---|---|---|---|
+| decode, batch 1 (1×1×896) | 111 µs | 19 µs | 5.8× | launch-bound |
+| decode, batch 32 (32×1×896) | 125 µs | 19 µs | 6.6× | 6 GB/s |
+| prefill 32×128×896 | 643 µs | 115 µs | 5.6× | 128 GB/s (40% of T4 peak) |
 
 Quantization accuracy (WikiText-2 test, 40 × 512-token windows):
 
@@ -42,19 +51,21 @@ Quantization accuracy (WikiText-2 test, 40 × 512-token windows):
 | fp16 | 18.07 | 988 MB |
 | INT8 (per-row, weight-only) | 17.99 | 631 MB |
 
-Correctness: logits match Hugging Face to 7.5e-5 max abs error; cached greedy == uncached greedy == HF greedy (with HF's default `repetition_penalty=1.1` disabled); batched left-padded output == per-prompt output.
+Correctness: logits match Hugging Face to 7.5e-5 max abs error; cached greedy == uncached greedy == HF greedy (with HF's default `repetition_penalty=1.1` disabled); batched left-padded output == per-prompt output; CUDA-graph decode == eager decode token-for-token.
 
 ## What the numbers say
 
-**The KV cache is the whole game.** Without it, throughput at batch 32 is 133 tok/s and falls with sequence length; with it, 1107. That is the quadratic-to-linear fix.
+**The KV cache is the whole game.** Without it, throughput at batch 32 is 131 tok/s and falls with sequence length; with it, 1076. That is the quadratic-to-linear fix.
 
-**Batching is where the bandwidth argument shows up.** Batch 1 → 32 is a 30× throughput gain for the same weight reads. At batch 1 every configuration lands near 30–40 tok/s regardless of precision, because a 24-layer decode step is ~300 small kernel launches and Python overhead dominates, not memory. The T4's 320 GB/s would allow ~300 tok/s; we get a tenth of that at batch 1.
+**CUDA graphs are the second-biggest win, and the biggest at small batch.** A 24-layer decode step is ~300 small kernel launches; at batch 1 the GPU finishes each in microseconds and then idles waiting for Python to launch the next. Capturing the step once and replaying it as a single launch gives 3.3× at batch 1 (36 → 120 tok/s), 2.9× at batch 8, and 1.8× at batch 32, where the weight reads start to dominate and launch overhead matters less. Getting there required making the step shape-static: a preallocated mask over the full cache, `index_copy_` at a device-side position, and no Python-side integers.
 
-**INT8 weight-only was a net loss on this hardware.** Weights shrank 988 → 631 MB and perplexity did not move (18.07 → 17.99, inside noise), but throughput dropped 17%. Dequantizing `int8 → fp16` on the fly in PyTorch is an extra full pass over every weight matrix per step, which costs more than the bandwidth it saves. The saving only materializes with a fused dequant-GEMM kernel that reads int8 and multiplies in one pass (what TensorRT-LLM and vLLM's quantized paths do).
+**Batching is where the bandwidth argument shows up.** Batch 1 → 32 is a 16× throughput gain for the same weight reads. The T4's 320 GB/s would allow ~300 tok/s at batch 1; we are at 120 with graphs, so launch overhead is gone but the remaining gap is attention and the unfused MLP.
 
-**The fused RMSNorm kernel is within noise.** It compiles, matches PyTorch to 1e-3, and replaces three launches with one, but RMSNorm is under 2% of a decode step for a 896-wide model. The lesson: profile before optimizing. The next kernel worth writing is the attention or the dequant-GEMM, not the norm.
+**INT8 weight-only was a net loss on this hardware.** Weights shrank 988 → 631 MB and perplexity did not move (18.07 → 17.99, inside noise), but throughput dropped 18%. Dequantizing `int8 → fp16` on the fly in PyTorch is an extra full pass over every weight matrix per step, which costs more than the bandwidth it saves. The saving only materializes with a fused dequant-GEMM kernel that reads int8 and multiplies in one pass (what TensorRT-LLM and vLLM's quantized paths do).
 
-**vLLM is 3.3× faster at batch 32.** The gap is CUDA graphs (the whole decode step captured once and replayed with no Python launch overhead), paged KV memory, and fused attention kernels. Those three are the obvious next steps.
+**The fused RMSNorm kernel is 5.8× faster than PyTorch in isolation but invisible end-to-end.** It replaces three launches (square, mean, multiply) with one HBM read and one write, reaching 128 GB/s on a prefill-sized block. But RMSNorm is under 2% of a decode step for an 896-wide model, so the end-to-end number moves inside noise. The lesson: profile before optimizing. The next kernel worth writing is the attention or the dequant-GEMM, not the norm.
+
+**vLLM is still 1.8× faster at batch 32.** Before CUDA graphs it was 3.3×. The rest of the gap is paged KV memory (no padding waste), fused attention kernels, and a fused dequant path. Those are the next steps.
 
 ## Run
 
@@ -64,6 +75,7 @@ python -m tests.test_engine --tiny      # architecture check, no download
 python -m tests.test_engine             # vs Qwen2.5-0.5B-Instruct
 python -m bench.bench                   # throughput → bench/results.csv
 python -m bench.ppl                     # perplexity → bench/ppl.csv
+python -m bench.kernel_bench            # fused kernel vs PyTorch → bench/kernel.csv
 python -m bench.plot                    # chart + resume numbers
 ```
 
