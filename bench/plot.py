@@ -10,7 +10,7 @@ for r in rows:
     if r["config"] not in configs: configs.append(r["config"])
 batches = sorted({int(r["batch"]) for r in rows})
 labels = {"hf_fp16": "Hugging Face (fp16)", "ours_nocache": "Ours: no cache (fp32)", "ours_cache": "Ours: KV cache (fp16)",
-          "ours_int8": "Ours: + INT8", "ours_fused": "Ours: + fused RMSNorm", "vllm": "vLLM"}
+          "ours_graph": "Ours: + CUDA graph", "ours_int8": "Ours: + INT8", "ours_fused": "Ours: + fused RMSNorm", "vllm": "vLLM"}
 
 fig, ax = plt.subplots(figsize=(8, 4.5))
 w = 0.8 / len(configs)
@@ -28,9 +28,9 @@ def get(c, b):
 
 print("\n=== Resume numbers ===")
 for b in batches:
-    hf, cache, int8, fused = get("hf_fp16", b), get("ours_cache", b), get("ours_int8", b), get("ours_fused", b)
-    best = max(v for v in (cache, int8, fused) if v)
+    hf, cache, int8, fused, graph = get("hf_fp16", b), get("ours_cache", b), get("ours_int8", b), get("ours_fused", b), get("ours_graph", b)
+    best = max(v for v in (cache, int8, fused, graph) if v)
     line = f"batch {b:2d}: ours {best:.0f} tok/s"
     if hf: line += f" vs HF {hf:.0f} ({best/hf:.1f}x)"
-    if cache and fused: line += f"; fused kernel {100*(1 - cache/fused):+.0f}% throughput vs cache-only"
+    if cache and graph: line += f"; CUDA graph {graph/cache:.1f}x over eager"
     print(line)

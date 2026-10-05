@@ -72,7 +72,8 @@ def main():
     with torch.no_grad():
         g_nc = ours.generate(ids, N, use_cache=False)
         g_c = ours.generate(ids, N, use_cache=True)
-        g_hf = hf.generate(ids, max_new_tokens=N, min_new_tokens=N, do_sample=False, pad_token_id=tok.pad_token_id)
+        g_hf = hf.generate(ids, max_new_tokens=N, min_new_tokens=N, do_sample=False, repetition_penalty=1.0,
+                           temperature=None, top_p=None, top_k=None, pad_token_id=tok.pad_token_id)
     assert torch.equal(g_nc, g_c), "cache changed output"
     assert torch.equal(g_c, g_hf), f"greedy mismatch vs HF\n{tok.decode(g_c[0])}\n{tok.decode(g_hf[0])}"
     print("[2] cached greedy == uncached == HF:", repr(tok.decode(g_c[0][ids.shape[1]:])))
@@ -85,6 +86,13 @@ def main():
             single = ours.generate(tok(p, return_tensors="pt").input_ids.to(device), N)
             assert torch.equal(gb[i, -N:], single[0, -N:]), f"batched row {i} differs"
     print("[3] batched greedy == individual")
+
+    # 3b. static (graph-capturable) decode == dynamic decode
+    from engine.graph import GraphDecoder
+    with torch.no_grad():
+        gs = GraphDecoder(ours, 4, enc.input_ids.shape[1] + N + 4).generate(enc.input_ids.to(device), N, enc.attention_mask.to(device))
+    assert torch.equal(gs, gb), "static/graph decode differs from dynamic"
+    print("[3b] CUDA-graph decode == eager decode")
 
     # 4. int8 greedy still sane
     from engine.quant import quantize_model

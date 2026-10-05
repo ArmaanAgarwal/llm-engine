@@ -58,6 +58,13 @@ class KVCache:
         self.v[layer, :, :, self.pos:self.pos + T] = v
         return self.k[layer, :, :, :self.pos + T], self.v[layer, :, :, :self.pos + T]
 
+    def update_static(self, layer: int, k: torch.Tensor, v: torch.Tensor, pos_t: torch.Tensor):
+        """Graph-safe single-token write: pos_t is a 1-element LongTensor on device. Returns the FULL cache
+        [batch, kv_heads, max_len, head_dim]; the caller masks positions >= pos. No Python-side shapes change."""
+        self.k[layer].index_copy_(2, pos_t, k)
+        self.v[layer].index_copy_(2, pos_t, v)
+        return self.k[layer], self.v[layer]
+
 
 # ----------------------------------------------------------------------------
 # RMSNorm: y = x / sqrt(mean(x^2) + eps) * weight.  Computed in fp32.
@@ -114,7 +121,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden, cfg.n_kv_heads * cfg.head_dim, bias=True)
         self.o_proj = nn.Linear(cfg.n_heads * cfg.head_dim, cfg.hidden, bias=False)
 
-    def forward(self, x, cos, sin, cache=None, layer=0, attn_mask=None):
+    def forward(self, x, cos, sin, cache=None, layer=0, attn_mask=None, pos_t=None):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -122,7 +129,10 @@ class Attention(nn.Module):
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
 
         if cache is not None:
-            k, v = cache.update(layer, k, v)        # [B, KV, pos+T, D]
+            if pos_t is not None:
+                k, v = cache.update_static(layer, k, v, pos_t)   # [B, KV, max_len, D]
+            else:
+                k, v = cache.update(layer, k, v)                 # [B, KV, pos+T, D]
 
         rep = self.n_heads // self.n_kv_heads
         k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
@@ -158,8 +168,8 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden, cfg.rms_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x, cos, sin, cache=None, layer=0, attn_mask=None):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, layer, attn_mask)
+    def forward(self, x, cos, sin, cache=None, layer=0, attn_mask=None, pos_t=None):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, layer, attn_mask, pos_t)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -185,13 +195,13 @@ class Model(nn.Module):
     def unembed(self, x):
         return x @ self.embed_tokens.weight.T if self.lm_head is None else self.lm_head(x)
 
-    def _run(self, ids, positions, cache=None, attn_mask=None):
+    def _run(self, ids, positions, cache=None, attn_mask=None, pos_t=None):
         """ids: [B, T]; positions: [B, T] or [T]."""
         x = self.embed_tokens(ids)
         cos_all, sin_all = self.rope(x.device, x.dtype)
         cos, sin = cos_all[positions], sin_all[positions]
         for i, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, cache, i, attn_mask)
+            x = layer(x, cos, sin, cache, i, attn_mask, pos_t)
         return self.unembed(self.norm(x))
 
     # --- No cache: full recompute. Used for correctness testing. ---
@@ -229,6 +239,18 @@ class Model(nn.Module):
         cache.pos += 1
         cache.attention_mask = am
         return logits
+
+    @torch.no_grad()
+    def decode_static(self, tok, cache, mask_f, pos_t):
+        """Graph-capturable decode step. All shapes fixed:
+             tok    [B, 1] long        the token to decode
+             mask_f [B, 1, 1, max_len] float, 0 for valid keys and -inf for empty/pad slots
+             pos_t  [1] long           write position (also the RoPE position when no left padding)
+           Positions per row = number of valid keys so far = (mask_f == 0).sum - 1 after this write.
+           Caller updates mask_f[:, :, :, pos] = 0 and pos_t += 1 between steps, in place."""
+        positions = (mask_f[:, 0, 0] == 0).sum(-1, keepdim=True)   # [B,1]  (slot pos already opened by caller)
+        positions = (positions - 1).clamp(min=0)
+        return self._run(tok, positions, cache, mask_f, pos_t)
 
     @torch.no_grad()
     def generate(self, ids, max_new_tokens, attention_mask=None, use_cache=True, eos_id=None):

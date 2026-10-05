@@ -60,6 +60,26 @@ def bench_ours(model, tok, batch, new_tokens, runs):
     return batch * new_tokens / td, statistics.median(prefill_times)
 
 
+def bench_ours_graph(model, tok, batch, new_tokens, runs):
+    from engine.graph import GraphDecoder
+    enc = tok(PROMPTS[:batch], return_tensors="pt", padding=True).to("cuda")
+    ids, am = enc.input_ids, enc.attention_mask
+    dec = GraphDecoder(model, batch, ids.shape[1] + new_tokens + 8)
+    # capture once
+    dec.prefill(ids, am); nxt = torch.zeros(batch, 1, dtype=torch.long, device="cuda"); dec.tok.copy_(nxt)
+    dec.mask_f[:, 0, 0].scatter_(1, dec.pos_t.expand(batch, 1), 0.0); dec.capture()
+    times = []
+    for r in range(runs + 1):
+        dec.prefill(ids, am)
+        def run():
+            n = nxt
+            for _ in range(new_tokens):
+                n = dec.step(n)[:, -1].argmax(-1, keepdim=True)
+        _, td = timed(run)
+        if r > 0: times.append(td)
+    return batch * new_tokens / statistics.median(times), float("nan")
+
+
 def bench_ours_nocache(model, tok, batch, new_tokens, runs):
     enc = tok(PROMPTS[:batch], return_tensors="pt", padding=True).to("cuda")
     ids = enc.input_ids
@@ -77,7 +97,7 @@ def bench_hf(tok, batch, new_tokens, runs):
     enc = tok(PROMPTS[:batch], return_tensors="pt", padding=True).to("cuda")
     times = []
     for r in range(runs + 1):
-        _, t = timed(lambda: m.generate(**enc, max_new_tokens=new_tokens, min_new_tokens=new_tokens, do_sample=False, pad_token_id=tok.pad_token_id))
+        _, t = timed(lambda: m.generate(**enc, max_new_tokens=new_tokens, min_new_tokens=new_tokens, do_sample=False, repetition_penalty=1.0, temperature=None, top_p=None, top_k=None, pad_token_id=tok.pad_token_id))
         if r > 0: times.append(t)
     del m; torch.cuda.empty_cache()
     return batch * new_tokens / statistics.median(times), float("nan")
@@ -126,6 +146,12 @@ def main():
 
     m = from_pretrained(device="cuda", dtype=torch.float16)
     for b in batches: record("ours_cache", b, *bench_ours(m, tok, b, a.new_tokens, a.runs))
+
+    if "graph" not in skip:
+        try:
+            for b in batches: record("ours_graph", b, *bench_ours_graph(m, tok, b, a.new_tokens, a.runs))
+        except Exception as e:
+            print("cuda graph skipped:", e)
 
     if "int8" not in skip:
         quantize_model(m)
