@@ -215,6 +215,7 @@ class Model(nn.Module):
     def prefill(self, ids, cache, attention_mask=None):
         """ids: [B, T] left-padded. attention_mask: [B, T] with 1 for real tokens. Returns logits [B, T, V]."""
         B, T = ids.shape
+        cache.pos = 0   # a prefill always starts a fresh sequence in this cache
         if attention_mask is None:
             attention_mask = torch.ones(B, T, device=ids.device, dtype=torch.long)
         # positions: real tokens count from 0; pads get 0
