@@ -29,7 +29,7 @@ def get(c, b):
 print("\n=== Resume numbers ===")
 for b in batches:
     hf, cache, int8, fused = get("hf_fp16", b), get("ours_cache", b), get("ours_int8", b), get("ours_fused", b)
-    best = fused or int8 or cache
+    best = max(v for v in (cache, int8, fused) if v)
     line = f"batch {b:2d}: ours {best:.0f} tok/s"
     if hf: line += f" vs HF {hf:.0f} ({best/hf:.1f}x)"
     if cache and fused: line += f"; fused kernel {100*(1 - cache/fused):+.0f}% throughput vs cache-only"

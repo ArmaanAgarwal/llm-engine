@@ -29,19 +29,31 @@ def perplexity(model, ids, window=512, n_windows=40):
     return math.exp(sum(nlls) / len(nlls))
 
 
+def load_wikitext2_test():
+    """WikiText-2 raw test split. Tries `datasets`, falls back to the parquet file on the Hub."""
+    try:
+        from datasets import load_dataset
+        return "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    except Exception as e:
+        print("datasets load failed, falling back to parquet:", str(e)[:80])
+        import pandas as pd
+        from huggingface_hub import hf_hub_download
+        f = hf_hub_download("Salesforce/wikitext", "wikitext-2-raw-v1/test-00000-of-00001.parquet", repo_type="dataset")
+        return "\n\n".join(pd.read_parquet(f)["text"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--windows", type=int, default=40)
     ap.add_argument("--out", default="bench/ppl.csv")
     a = ap.parse_args()
 
-    from datasets import load_dataset
     from transformers import AutoTokenizer
     from engine.model import from_pretrained
     from engine.quant import quantize_model, weight_bytes
 
     tok = AutoTokenizer.from_pretrained(REPO)
-    text = "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    text = load_wikitext2_test()
     ids = tok(text, return_tensors="pt").input_ids.cuda()
 
     rows = []

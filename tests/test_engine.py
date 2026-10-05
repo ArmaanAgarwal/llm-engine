@@ -61,14 +61,14 @@ def main():
     # 1. logits
     worst = 0
     for p in PROMPTS:
-        ids = tok(p, return_tensors="pt").input_ids
+        ids = tok(p, return_tensors="pt").input_ids.to(device)
         with torch.no_grad():
             d = (ours(ids).float() - hf(ids).logits.float()).abs().max().item()
         worst = max(worst, d)
     print(f"[1] max logit diff {worst:.6f} (tol {tol})"); assert worst < tol
 
     # 2. cached == uncached == hf
-    ids = tok(PROMPTS[0], return_tensors="pt").input_ids
+    ids = tok(PROMPTS[0], return_tensors="pt").input_ids.to(device)
     with torch.no_grad():
         g_nc = ours.generate(ids, N, use_cache=False)
         g_c = ours.generate(ids, N, use_cache=True)
@@ -80,9 +80,9 @@ def main():
     # 3. batched == individual
     enc = tok(PROMPTS, return_tensors="pt", padding=True)
     with torch.no_grad():
-        gb = ours.generate(enc.input_ids, N, attention_mask=enc.attention_mask)
+        gb = ours.generate(enc.input_ids.to(device), N, attention_mask=enc.attention_mask.to(device))
         for i, p in enumerate(PROMPTS):
-            single = ours.generate(tok(p, return_tensors="pt").input_ids, N)
+            single = ours.generate(tok(p, return_tensors="pt").input_ids.to(device), N)
             assert torch.equal(gb[i, -N:], single[0, -N:]), f"batched row {i} differs"
     print("[3] batched greedy == individual")
 
