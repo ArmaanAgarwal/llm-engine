@@ -80,3 +80,4 @@ python -m bench.plot                    # chart + resume numbers
 ```
 
 Or open `run_all.ipynb` in Colab with a T4 runtime and Run all.
+
